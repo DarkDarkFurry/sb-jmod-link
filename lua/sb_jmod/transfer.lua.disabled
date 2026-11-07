@@ -1,0 +1,161 @@
+--[[--------------------------------------------------------------------
+	SB <-> JMod Link :: Transfer (v4.8)
+	Поддержка: JMod, Spacebuild/SB, CAF.
+	Роли устройств:
+	  генератор  ("generator", "gen_", "powersource", "reactor")
+	  накопитель (всё остальное: банки, батареи)
+	Правила сети:
+	  генератор -> банк      : разрешено (наполнение до равной доли)
+	  банк <-> банк          : разрешено (равный делёж между банками)
+	  банк -> генератор      : ЗАПРЕЩЕНО всегда
+	  генератор <-> генератор: ЗАПРЕЩЕНО (не выравниваются)
+	Делёж поровну: суммарная энергия пары делится на равные доли
+	(с учётом ёмкостей). Энергия идёт туда, где её меньше.
+	Интервал: 0,1 секунды. Лог: sbjmod_transferlog 1
+	Тип "caf" без глобального RD работает через методы энтити.
+--------------------------------------------------------------------]]
+
+local cvLog = CreateConVar("sbjmod_transferlog", "0", FCVAR_ARCHIVE,
+	"Показывать перекачку энергии в консоли (0/1)")
+
+-- Чтение заряда устройства: возвращает текущее значение и ёмкость
+local function GetCharge(e, t)
+	if t == "jmod" then
+		local ok, cur = pcall(e.GetElectricity, e)
+		if not ok or cur == nil then return nil end
+		local max = tonumber(e.MaxElectricity) or 1000
+		if max <= 0 then max = 1000 end
+		return tonumber(cur) or 0, max
+
+	elseif t == "sb" or t == "caf" then
+		-- Если RD доступен — пробуем его (ветка caf)
+		if t == "caf" and RD and isfunction(RD.GetResourceAmount) then
+			local ok, cur = pcall(RD.GetResourceAmount, e, "energy")
+			if ok and cur ~= nil then
+				local cap = 10000
+				if isfunction(e.GetNetworkCapacity) then
+					local okc, c = pcall(e.GetNetworkCapacity, e, "energy")
+					if okc and tonumber(c) and tonumber(c) > 0 then cap = tonumber(c) end
+				end
+				return tonumber(cur) or 0, cap
+			end
+		end
+		-- Читаем методы самой энтити (случай fusion-генератора без RD)
+		local ok, cur = pcall(e.GetResourceAmount, e, "energy")
+		if not ok or cur == nil then return nil end
+		local cap = 10000
+		if isfunction(e.GetNetworkCapacity) then
+			local okc, c = pcall(e.GetNetworkCapacity, e, "energy")
+			if okc and tonumber(c) and tonumber(c) > 0 then cap = tonumber(c) end
+		end
+		return tonumber(cur) or 0, cap
+	end
+
+	return nil
+end
+
+-- Запись заряда устройства
+local function SetCharge(e, t, val)
+	val = math.max(0, math.floor(val))
+	if t == "jmod" then
+		pcall(e.SetElectricity, e, val)
+	elseif t == "sb" then
+		pcall(e.SetResourceAmount, e, "energy", val)
+	elseif t == "caf" then
+		if RD and isfunction(RD.SetResourceAmount) then
+			local ok, _ = pcall(RD.SetResourceAmount, e, "energy", val)
+			if ok then return end
+		end
+		pcall(e.SetResourceAmount, e, "energy", val)
+	end
+end
+
+-- Роль устройства: "gen" (генератор) или "bank" (накопитель)
+local function GetRole(e)
+	local cls = string.lower(e:GetClass() or "")
+	if string.find(cls, "generator", 1, true)
+		or string.find(cls, "gen_", 1, true)
+		or string.find(cls, "_gen", 1, true)
+		or string.find(cls, "powersource", 1, true)
+		or string.find(cls, "reactor", 1, true) then
+		return "gen"
+	end
+	return "bank"
+end
+
+local function TransferLink(l)
+	if not IsValid(l.a) or not IsValid(l.b) then return end
+
+	local ta = SB_JMOD.Identify and SB_JMOD.Identify(l.a) or nil
+	local tb = SB_JMOD.Identify and SB_JMOD.Identify(l.b) or nil
+	if not ta or not tb then return end
+
+	local roleA = GetRole(l.a)
+	local roleB = GetRole(l.b)
+
+	-- Маршруты
+	if roleA == "gen" and roleB == "gen" then
+		-- генераторы между собой не обмениваются вообще
+		return
+	end
+
+	local allowAB = true
+	local allowBA = true
+	if roleA == "bank" and roleB == "gen" then
+		allowAB = false -- банк -> генератор запрещён
+	elseif roleB == "bank" and roleA == "gen" then
+		allowBA = false -- банк -> генератор запрещён
+	end
+
+	local curA, capA = GetCharge(l.a, ta)
+	local curB, capB = GetCharge(l.b, tb)
+	if not curA or not curB or not capA or not capB then return end
+	if capA <= 0 or capB <= 0 then return end
+
+	local total = curA + curB
+	if total <= 0 then return end
+
+	-- Целевые равные доли (с учётом ёмкостей)
+	local wantA = math.min(math.floor(total / 2), capA)
+	local wantB = math.min(total - wantA, capB)
+	if wantB < total - wantA then
+		wantA = math.min(total - wantB, capA)
+	elseif wantA < total - wantB then
+		wantB = math.min(total - wantA, capB)
+	end
+
+	local function DoMove(src, srcT, dst, dstT, sCur, sWant, dCur, dWant, srcEnt, dstEnt)
+		local surplus = sCur - sWant
+		local deficit = dWant - dCur
+		if surplus <= 0 or deficit <= 0 then return 0 end
+		local give = math.min(surplus, deficit)
+		if give <= 0 then return 0 end
+
+		SetCharge(src, srcT, sCur - give)
+		SetCharge(dst, dstT, dCur + give)
+
+		if cvLog:GetBool() then
+			print(("[SBJMOD] %s (%s) -> %s (%s): +%d"):format(
+				srcEnt:GetClass(), srcEnt == l.a and roleA or roleB,
+				dstEnt:GetClass(), dstEnt == l.a and roleA or roleB, give))
+		end
+		return give
+	end
+
+	if allowAB and curA > wantA then
+		DoMove(l.a, ta, l.b, tb, curA, wantA, curB, wantB, l.a, l.b)
+	end
+	if allowBA and curB > wantB then
+		DoMove(l.b, tb, l.a, ta, curB, wantB, curA, wantA, l.b, l.a)
+	end
+end
+
+-- Перекачка каждые 0,1 секунды
+timer.Create("SBJMOD_Transfer", 0.1, 0, function()
+	if not SB_JMOD.Links or #SB_JMOD.Links == 0 then return end
+	for _, l in ipairs(SB_JMOD.Links) do
+		pcall(TransferLink, l)
+	end
+end)
+
+print("[SBJMOD] Модуль transfer v4.8 загружен: базовая конфигурация — JMod, SB, CAF")
