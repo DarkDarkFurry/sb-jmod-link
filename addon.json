@@ -1,6 +1,0 @@
-{
-    "title": "SB <-> JMod Link",
-    "type": "tool",
-    "tags": ["build", "fun"],
-    "ignore": ["*.md", "*.zip"]
-}
